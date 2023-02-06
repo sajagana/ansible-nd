@@ -36,11 +36,22 @@ import json
 import pickle
 import traceback
 import mimetypes
+# import datetime
+import shutil
 import tempfile
 from ansible.module_utils.six import PY3
 from ansible.module_utils._text import to_native, to_text
 from ansible.module_utils.connection import ConnectionError
 from ansible.plugins.httpapi import HttpApiBase
+# from ansible_collections.cisco.nd.plugins.module_utils.nd import nd_argument_spec
+# from ansible.module_utils.basic import AnsibleModule
+
+
+
+from ansible_collections.cisco.nd.plugins.module_utils.nd import NDModule, nd_argument_spec
+from ansible.module_utils.basic import AnsibleModule
+
+
 
 try:
     from requests_toolbelt.multipart.encoder import MultipartEncoder
@@ -48,6 +59,21 @@ try:
     HAS_MULTIPART_ENCODER = True
 except ImportError:
     HAS_MULTIPART_ENCODER = False
+
+
+# def nd_argument_spec():
+#     return dict(
+#         # host=dict(type="str", required=False, aliases=["hostname"], fallback=(env_fallback, ["ND_HOST"])),
+#         # port=dict(type="int", required=False, fallback=(env_fallback, ["ND_PORT"])),
+#         # username=dict(type="str", fallback=(env_fallback, ["ND_USERNAME", "ANSIBLE_NET_USERNAME"])),
+#         # password=dict(type="str", required=False, no_log=True, fallback=(env_fallback, ["ND_PASSWORD", "ANSIBLE_NET_PASSWORD"])),
+#         # output_level=dict(type="str", default="normal", choices=["debug", "info", "normal"], fallback=(env_fallback, ["ND_OUTPUT_LEVEL"])),
+#         # timeout=dict(type="int", default=30, fallback=(env_fallback, ["ND_TIMEOUT"])),
+#         # use_proxy=dict(type="bool", fallback=(env_fallback, ["ND_USE_PROXY"])),
+#         # use_ssl=dict(type="bool", fallback=(env_fallback, ["ND_USE_SSL"])),
+#         # validate_certs=dict(type="bool", fallback=(env_fallback, ["ND_VALIDATE_CERTS"])),
+#         # login_domain=dict(type="str", fallback=(env_fallback, ["ND_LOGIN_DOMAIN"])),
+#     )
 
 
 class HttpApi(HttpApiBase):
@@ -201,6 +227,7 @@ class HttpApi(HttpApiBase):
         try:
             self.connection.queue_message("info", "send_request() - connection.send({0}, {1}, {2}, {3})".format(path, data, method, self.headers))
             response, rdata = self.connection.send(path, data, method=method, headers=self.headers)
+            return self._verify_response(response, method, path, rdata)
         except ConnectionError as connection_err:
             self.connection.queue_message("info", "send_request() - ConnectionError Exception: {0}".format(connection_err))
             raise
@@ -209,15 +236,94 @@ class HttpApi(HttpApiBase):
             if self.error is None:
                 self.error = dict(code=self.status, message="ND HTTPAPI send_request() Exception: {0} - {1}".format(e, traceback.format_exc()))
             raise ConnectionError(json.dumps(self._verify_response(None, method, full_path, None)))
+
+    def send_file_request_temp(self, method, path, file=None, data=None):
+        """This method handles all ND REST API requests other than login"""
+
+        self.error = None
+        self.path = ""
+        self.status = -1
+        self.info = {}
+        self.method = "GET"
+        if method is not None:
+            self.method = method
+
+        data_str = io.StringIO()
+
+        # Perform some very basic path input validation.
+        path = str(path)
+        if path[0] != '/':
+            self.error = dict(
+                code=self.status, message='Value of <path> does not appear to be formated properly')
+            raise ConnectionError(json.dumps(
+                self._verify_response(None, method, path, None)))
+        full_path = self.connection.get_option('host') + path
+
+        # try:
+        #     # create data field
+        #     data["uploadedFileName"] = os.path.basename(file)
+        #     data_str = io.StringIO()
+        #     json.dump(data, data_str)
+        # except Exception as e:
+        #     self.error = dict(code=self.status, message='ND HTTPAPI create data field Exception: {0} - {1}'.format(e, traceback.format_exc()))
+        #     raise ConnectionError(json.dumps(self._verify_response(None, method, path, None)))
+
+        # try:
+        # create fields for MultipartEncoder
+        # fields = dict(data=fields, file=(os.path.basename(file), open(file, 'rb'), mimetypes.guess_type(file)))
+        # mp_encoder = MultipartEncoder(fields=fields)
+
+        # fields = dict(file=(os.path.basename(file), open(file, 'rb'), mimetypes.guess_type(file)))
+
+        # create fields for MultipartEncoder
+        fields = dict(rdir="/tmp",
+                      name=(os.path.basename(file), open(file, 'rb'), mimetypes.guess_type(file)))
+
+        self.connection.queue_message(
+            'info',
+            'send_file_request() - reseting connection as host has changed from {0}'.format(
+                fields
+            )
+        )
+
+        # fields = dict(file=(os.path.basename(file).split(
+        #     "-")[1], open(file, 'rb'), mimetypes.guess_type(file)))
+        try:
+            mp_encoder = MultipartEncoder(fields=fields)
+            self.headers['Content-Type'] = mp_encoder.content_type
+            self.headers['Accept'] = '*/*'
+            self.headers['Accept-Encoding'] = 'gzip, deflate, br'
+
+            self.connection.queue_message(
+                'info', 'send_file_request() - connection.send({0}, {1}, {2}, {3})'.format(path, data, method, self.headers))
+
+            response, rdata = self.connection.send(
+                path, mp_encoder.to_string(), method="POST", headers=self.headers)
+
+            self.connection.queue_message(
+                'info',
+                'send_file_request() - reseting connection as host has changed from response: {0}, rdata: {1}'.format(
+                    response, rdata
+                )
+            )
+
+        except Exception as e:
+            self.error = dict(
+                code=self.status, message='ND HTTPAPI MultipartEncoder Exception: {0} - {1} '.format(e, traceback.format_exc()))
+            raise ConnectionError(json.dumps(
+                self._verify_response(None, method, full_path, None)))
+
         return self._verify_response(response, method, full_path, rdata)
+
+        # return self._verify_response(response, method, path, rdata)
 
     def send_file_request(self, method, path, file=None, data=dict(), remote_path=None):
         """This method handles file download and upload operations
-        :arg method (str): Method can be GET or POST
-        :arg path (str): Path should be the resource path
-        :arg file (str): The absolute file path of the target file
-        :arg data (dict): Data should be the dictionary object
-        :arg remote_path (str): Remote directory path to download/upload the file object
+        :arg method: Method can be GET or POST
+        :arg path: Path should be the resource path
+        :arg file: The file path of the target file
+        :kwarg data:Data should be the dictionary object
+        :arg remote_path: Remote directory path to download/upload the file object
 
         :returns: Dict object which contains the status of the REST API call.
         The **response** contains the 'status' and other metadata. When a HttpError (status >= 400)
@@ -253,7 +359,7 @@ class HttpApi(HttpApiBase):
         try:
             # create fields for MultipartEncoder
             if remote_path:
-                fields = dict(rdir=remote_path, name=(os.path.basename(file), open(file, "rb"), mimetypes.guess_type(file)))
+                fields = dict(rdir=remote_path, name=(os.path.basename(file), open(file, 'rb'), mimetypes.guess_type(file)))
             else:
                 fields = dict(data=("data.json", data_str, "application/json"), file=(os.path.basename(file), open(file, "rb"), mimetypes.guess_type(file)))
 
@@ -346,10 +452,11 @@ class HttpApi(HttpApiBase):
             info.update(temp_headers)
         return info
 
-    def get_remote_file_io_stream(self, path, tmpdir, method="GET"):
+    def get_remote_file_io_stream(self, path, tmpdir , method="GET"):
         """This method handles file download and upload operations
         :arg path (str): Path should be the resource path
         :arg tmpdir (str): Ansible module temporary execution directory which is used to create the temporary file object
+        # :arg destination (str): The destination directory is used to write the file object
         :arg method (str): Method can be GET or POST
 
         :returns: Dict object which contains the status of the REST API call.
@@ -363,6 +470,7 @@ class HttpApi(HttpApiBase):
                             method="GET",
                         )
         """
+        # self.connection.queue_message("info", "Inside get_remote_file_io_stream - 0")
 
         self.error = None
         self.path = ""
@@ -371,12 +479,18 @@ class HttpApi(HttpApiBase):
         self.method = "GET"
         if method is not None:
             self.method = method
+        # self.connection.queue_message("info", "Inside get_remote_file_io_stream - 1")
 
         try:
             response, rdata = self.connection.send(path, {}, method=method, headers=self.headers)
             verified_response = self._verify_response(response, method, path, rdata)
+
+            # self.connection.queue_message("info", "Inside get_remote_file_io_stream - 1.1")
         except Exception as error:
             raise ConnectionError("File download operation failed due to: {0}".format(error))
+            # self.connection.queue_message("info", "Inside get_remote_file_io_stream - 1.2")
+
+        # self.connection.queue_message("info", "Inside get_remote_file_io_stream - response: {0}".format(verified_response))
 
         if verified_response["status"] in (301, 302, 303, 307):
             return verified_response
@@ -394,5 +508,90 @@ class HttpApi(HttpApiBase):
 
         f.close()
 
+        # self.connection.queue_message("info", "Inside get_remote_file_io_stream - 2")
+
+        # # temp code by sabari
+        #
+        # self.connection.queue_message("info",
+        #                               "Inside get_remote_file_io_stream - 2.1 - destination: {0}, rdata: {1}".format(
+        #                                   destination, rdata))
+        # self.connection.queue_message("info", "Inside get_remote_file_io_stream - 2.0")
+        # self.connection.queue_message("info", "Inside get_remote_file_io_stream - 2.0: {0}".format(tmpdir))
+        #
+        # # self.connection.queue_message("info", "Inside get_remote_file_io_stream - 2.0: {0}".format(type(self.nd.sha1)))
+        # # self.connection.queue_message("info", "Inside get_remote_file_io_stream - 2.0: {0}".format(self.nd.tmpdir))
+        #
+        # # Create the local file object
+        #
+        # # argument_spec = nd_argument_spec()
+        # #
+        # # module = AnsibleModule(
+        # #     argument_spec=argument_spec,
+        # # )
+        # #
+        # # # nd = NDModule(module)
+        # #
+        # #
+        # # # module = AnsibleModule(argument_spec=nd_argument_spec(), bypass_checks=True)
+        # # self.connection.queue_message("info", "Inside get_remote_file_io_stream - 2.0: {0}".format(type(module.sha1)))
+        # # self.connection.queue_message("info", "Inside get_remote_file_io_stream - 2.0: {0}".format(module.tmpdir))
+        #
+        #
+        # self.connection.queue_message("info", "Inside get_remote_file_io_stream - 2.2")
+        # self.write_io_stream_to_file("module", destination, rdata, tmpdir)
+        # self.connection.queue_message("info", "Inside get_remote_file_io_stream - 2.3")
+        #
+        # # temp code by sabari
+
+        # try:
+        #     # self.connection.queue_message("info",
+        #     #                               "Inside get_remote_file_io_stream - 2.1 - destination: {0}, rdata: {1}".format(
+        #     #                                   destination, rdata))
+        #     # self.connection.queue_message("info", "Inside get_remote_file_io_stream - 2.0")
+        #
+        #     # Create the local file object
+        #     # module = AnsibleModule(nd_argument_spec())
+        #     self.connection.queue_message("info", "Inside get_remote_file_io_stream - 2.2")
+        #     tmpsrc = self.write_io_stream_to_file(rdata, tmpdir)
+        #     self.connection.queue_message("info", "Inside get_remote_file_io_stream - 2.3")
+        #
+        # except Exception as error:
+        #     raise ConnectionError("Local file object creation failed due to: {0}".format(error))
+
+
         verified_response["tmpsrc"] = tmpsrc
         return verified_response
+
+    def write_io_stream_to_file(self, content, tmpdir):
+        """This method handles file download and upload operations
+            :arg tmpdir (str): Ansible module temporary execution directory which is used to create the temporary file object
+            :arg content (_io.BytesIO): Memory location of the I/O bytes buffer
+
+            :returns: Path of the Temporary file object
+            Raise an exception if the temporary file object creation fails
+
+            Example:
+                write_io_stream_to_file(
+                    module=AnsibleModule,
+                    destination="/tmp",
+                    content=rdata,
+                )
+        """
+        self.connection.queue_message("info", "Inside write io stream")
+        fd, tmpsrc = tempfile.mkstemp(dir=tmpdir)
+        f = open(tmpsrc, "wb")
+        try:
+            self.connection.queue_message("info", "Inside write io stream content write block")
+            f.write(content.getbuffer())
+        except Exception as e:
+            os.remove(tmpsrc)
+            f.close()
+            raise ConnectionError("Failed to the create temporary content file: {0}".format(to_native(e)))
+
+        f.close()
+
+        self.connection.queue_message("info", "Inside write io stream content write block 1 type: {0}, value: {1}".format(type(tmpsrc), tmpsrc))
+
+        self.connection.queue_message("info", "Inside write io stream content write block 1")
+
+        return tmpsrc
